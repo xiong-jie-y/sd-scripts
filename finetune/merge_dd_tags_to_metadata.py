@@ -1,10 +1,12 @@
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import List
 from tqdm import tqdm
 import library.train_util as train_util
 
+from PIL import Image
 
 def main(args):
   assert not args.recursive or (args.recursive and args.full_path), "recursive requires full_path / recursiveはfull_pathと同時に指定してください"
@@ -27,7 +29,33 @@ def main(args):
   print("merge tags to metadata json.")
   for image_path in tqdm(image_paths):
     tags_path = image_path.with_suffix(args.caption_extension)
-    tags = tags_path.read_text(encoding='utf-8').strip()
+    tags_path = str(tags_path)
+    image_path = str(image_path)
+
+    open_failed = False
+    try:
+      Image.open(image_path).load()
+    except:
+      open_failed = True
+    if not os.path.exists(tags_path):
+        print("Removing the unlabeled file.")
+        os.remove(image_path)
+        continue
+
+    if open_failed:
+        print("Removing the broke iage.")
+        os.remove(image_path)
+        continue
+
+    with open(tags_path, "rt", encoding='utf-8') as f:
+      lines = f.readlines()
+      # print("line", lines)
+      if len(lines) == 0:
+        print("Removing the strange file.")
+        os.remove(tags_path)
+        os.remove(image_path)
+        continue
+      tags = lines[0].strip()
 
     image_key = str(image_path) if args.full_path else image_path.stem
     if image_key not in metadata:
@@ -60,3 +88,4 @@ if __name__ == '__main__':
 
   args = parser.parse_args()
   main(args)
+
