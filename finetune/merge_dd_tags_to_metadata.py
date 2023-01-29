@@ -8,6 +8,7 @@ import json
 
 from tqdm import tqdm
 
+from PIL import Image
 
 def main(args):
   image_paths = glob.glob(os.path.join(args.train_data_dir, "*.jpg")) + \
@@ -29,8 +30,31 @@ def main(args):
   print("merge tags to metadata json.")
   for image_path in tqdm(image_paths):
     tags_path = os.path.splitext(image_path)[0] + '.txt'
+
+    open_failed = False
+    try:
+      Image.open(image_path).load()
+    except:
+      open_failed = True
+    if not os.path.exists(tags_path):
+        print("Removing the unlabeled file.")
+        os.remove(image_path)
+        continue
+
+    if open_failed:
+        print("Removing the broke iage.")
+        os.remove(image_path)
+        continue
+
     with open(tags_path, "rt", encoding='utf-8') as f:
-      tags = f.readlines()[0].strip()
+      lines = f.readlines()
+      # print("line", lines)
+      if len(lines) == 0:
+        print("Removing the strange file.")
+        os.remove(tags_path)
+        os.remove(image_path)
+        continue
+      tags = lines[0].strip()
 
     image_key = image_path if args.full_path else os.path.splitext(os.path.basename(image_path))[0]
     if image_key not in metadata:
@@ -58,3 +82,4 @@ if __name__ == '__main__':
 
   args = parser.parse_args()
   main(args)
+
