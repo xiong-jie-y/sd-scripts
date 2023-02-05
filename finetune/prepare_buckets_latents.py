@@ -1,4 +1,6 @@
 import argparse
+import io
+import multiprocessing
 import os
 import json
 
@@ -11,6 +13,13 @@ from torchvision import transforms
 
 import library.model_util as model_util
 import library.train_util as train_util
+
+import torch.multiprocessing as multiprocessing
+
+if multiprocessing.get_start_method() == 'fork':
+    multiprocessing.set_start_method('spawn', force=True)
+    print("{} setup done".format(multiprocessing.get_start_method()))
+
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -51,6 +60,46 @@ def get_npz_filename_wo_ext(data_dir, image_key, is_full_path, flip):
   return os.path.join(data_dir, base_name)
 
 
+vae = None
+
+def init_worker(model_name_or_path, weight_dtype, lock, count, num_gpus):
+  global vae
+  lock.acquire()
+  
+  if "CUDA_VISIBLE_DEVICES" in os.environ:
+      gpus = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
+      os.environ["CUDA_VISIBLE_DEVICES"] = str(gpus[count.value % num_gpus])
+  else:
+      os.environ["CUDA_VISIBLE_DEVICES"] = str(count.value % num_gpus)
+  print("using GPU", os.environ["CUDA_VISIBLE_DEVICES"])
+  count.value += 1
+
+  lock.release()
+
+  vae = model_util.load_vae(model_name_or_path, weight_dtype)
+  vae.eval()
+  vae.to(DEVICE, dtype=weight_dtype)
+
+def process(args):
+  index, is_last, bucket, weight_dtype, batch_size, train_data_dir, full_path, flip_aug = args
+  if (is_last and len(bucket) > 0) or len(bucket) >= batch_size:
+    latents = get_latents(vae, [img for _, _, img in bucket], weight_dtype)
+
+    for (image_key, _, _), latent in zip(bucket, latents):
+      npz_file_name = get_npz_filename_wo_ext(train_data_dir, image_key, full_path, False)
+      np.savez(npz_file_name, latent)
+
+    # flip
+    if flip_aug:
+      latents = get_latents(vae, [img[:, ::-1].copy() for _, _, img in bucket], weight_dtype)   # copyがないとTensor変換できない
+
+      for (image_key, _, _), latent in zip(bucket, latents):
+        npz_file_name = get_npz_filename_wo_ext(train_data_dir, image_key, full_path, True)
+        np.savez(npz_file_name, latent)
+
+    return index, True
+  return index, False
+
 def main(args):
   image_paths = train_util.glob_images(args.train_data_dir)
   print(f"found {len(image_paths)} images.")
@@ -69,9 +118,12 @@ def main(args):
   elif args.mixed_precision == "bf16":
     weight_dtype = torch.bfloat16
 
-  vae = model_util.load_vae(args.model_name_or_path, weight_dtype)
-  vae.eval()
-  vae.to(DEVICE, dtype=weight_dtype)
+  lock = multiprocessing.Lock()
+  count = multiprocessing.Value('i', 0)
+  pool = multiprocessing.Pool(
+    args.num_gpu_workers, initializer=init_worker, initargs=(
+    args.model_name_or_path, weight_dtype,lock,count, args.num_gpu_workers))
+
 
   # bucketのサイズを計算する
   max_reso = tuple([int(t) for t in args.max_resolution.split(',')])
@@ -87,24 +139,12 @@ def main(args):
   img_ar_errors = []
 
   def process_batch(is_last):
-    for j in range(len(buckets_imgs)):
-      bucket = buckets_imgs[j]
-      if (is_last and len(bucket) > 0) or len(bucket) >= args.batch_size:
-        latents = get_latents(vae, [img for _, _, img in bucket], weight_dtype)
-
-        for (image_key, _, _), latent in zip(bucket, latents):
-          npz_file_name = get_npz_filename_wo_ext(args.train_data_dir, image_key, args.full_path, False)
-          np.savez(npz_file_name, latent)
-
-        # flip
-        if args.flip_aug:
-          latents = get_latents(vae, [img[:, ::-1].copy() for _, _, img in bucket], weight_dtype)   # copyがないとTensor変換できない
-
-          for (image_key, _, _), latent in zip(bucket, latents):
-            npz_file_name = get_npz_filename_wo_ext(args.train_data_dir, image_key, args.full_path, True)
-            np.savez(npz_file_name, latent)
-
-        bucket.clear()
+    # for j in range(len(buckets_imgs)):
+    for index, processed in pool.imap_unordered(process, [
+      (j, is_last, buckets_imgs[j], weight_dtype, args.batch_size, args.train_data_dir, args.full_path, args.flip_aug)
+      for j in range(len(buckets_imgs))]):
+      if processed:
+        buckets_imgs[index].clear()
 
   # 読み込みの高速化のためにDataLoaderを使うオプション
   if args.max_data_loader_n_workers is not None:
@@ -193,6 +233,11 @@ def main(args):
     # cv2.imwrite(f"r:\\test\\img_{i:05d}.jpg", image[:, :, ::-1])
 
     # バッチへ追加
+    
+    # img_bytes = io.BytesIO()
+    # image.save(img_bytes, format='JPEG')
+    # img_bytes = img_bytes.getvalue()
+
     buckets_imgs[bucket_id].append((image_key, reso, image))
     bucket_counts[bucket_id] += 1
     metadata[image_key]['train_resolution'] = reso
@@ -238,6 +283,6 @@ if __name__ == '__main__':
                       help="flip augmentation, save latents for flipped images / 左右反転した画像もlatentを取得、保存する")
   parser.add_argument("--skip_existing", action="store_true",
                       help="skip images if npz already exists (both normal and flipped exists if flip_aug is enabled) / npzが既に存在する画像をスキップする（flip_aug有効時は通常、反転の両方が存在する画像をスキップ）")
-
+  parser.add_argument("--num_gpu_workers", type=int, default=1)
   args = parser.parse_args()
   main(args)

@@ -57,7 +57,7 @@ def main(args):
         continue
       tags = lines[0].strip()
 
-    image_key = str(image_path) if args.full_path else image_path.stem
+    image_key = image_path if args.full_path else os.path.splitext(os.path.basename(image_path))[0]
     if image_key not in metadata:
       metadata[image_key] = {}
 
