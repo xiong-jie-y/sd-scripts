@@ -165,11 +165,6 @@ def train(args):
   train_dataloader = torch.utils.data.DataLoader(
       train_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn, num_workers=n_workers)
 
-  # 学習ステップ数を計算する
-  if args.max_train_epochs is not None:
-    args.max_train_steps = args.max_train_epochs * len(train_dataloader)
-    print(f"override steps. steps for {args.max_train_epochs} epochs is / 指定エポックまでのステップ数: {args.max_train_steps}")
-
   # lr schedulerを用意する
   lr_scheduler = diffusers.optimization.get_scheduler(
       args.lr_scheduler, optimizer, num_warmup_steps=args.lr_warmup_steps, num_training_steps=args.max_train_steps * args.gradient_accumulation_steps)
@@ -187,6 +182,12 @@ def train(args):
         unet, text_encoder, optimizer, train_dataloader, lr_scheduler)
   else:
     unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(unet, optimizer, train_dataloader, lr_scheduler)
+
+  # 学習ステップ数を計算する
+  if args.max_train_epochs is not None:
+    args.max_train_steps = args.max_train_epochs * len(train_dataloader)
+    print(f"override steps. steps for {args.max_train_epochs} epochs is / 指定エポックまでのステップ数: {args.max_train_steps}")
+
 
   # 実験的機能：勾配も含めたfp16学習を行う　PyTorchにパッチを当ててfp16でのgrad scaleを有効にする
   if args.full_fp16:
