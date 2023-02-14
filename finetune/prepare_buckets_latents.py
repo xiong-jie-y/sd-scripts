@@ -1,5 +1,4 @@
 import argparse
-import io
 import multiprocessing
 import os
 import json
@@ -14,14 +13,12 @@ from torchvision import transforms
 import library.model_util as model_util
 import library.train_util as train_util
 
-import torch.multiprocessing as multiprocessing
-
 if multiprocessing.get_start_method() == 'fork':
     multiprocessing.set_start_method('spawn', force=True)
     print("{} setup done".format(multiprocessing.get_start_method()))
 
 
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+DEVICE = None
 
 IMAGE_TRANSFORMS = transforms.Compose(
     [
@@ -59,104 +56,61 @@ def get_npz_filename_wo_ext(data_dir, image_key, is_full_path, flip):
     base_name += '_flip'
   return os.path.join(data_dir, base_name)
 
+bucket_aspect_ratios = None
+buckets_imgs = None
+bucket_counts = None
+img_ar_errors = None
+args = None
+weight_dtype = None
+vae =  None
+bucket_resos = None
+metadata = None
 
-vae = None
-
-def init_worker(model_name_or_path, weight_dtype, lock, count, num_gpus):
+def initialize(lock, count, bucket_aspect_ratios_input, args_input, weight_dtype_input, bucket_resos_input, metadata_input):
+  global bucket_aspect_ratios
+  global buckets_imgs
+  global bucket_counts
+  global img_ar_errors
+  global args
+  global weight_dtype
   global vae
+  global bucket_resos
+  global metadata
+
+  bucket_resos = bucket_resos_input
+
+  metadata = metadata_input
+
+  global DEVICE
   lock.acquire()
-  
-  if "CUDA_VISIBLE_DEVICES" in os.environ:
-      gpus = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
-      os.environ["CUDA_VISIBLE_DEVICES"] = str(gpus[count.value % num_gpus])
-  else:
-      os.environ["CUDA_VISIBLE_DEVICES"] = str(count.value % num_gpus)
-  print("using GPU", os.environ["CUDA_VISIBLE_DEVICES"])
+
+  gpu_id = str(count.value % torch.cuda.device_count())
+  print(f"Using GPU {gpu_id}")
+
+  DEVICE = torch.device('cuda:' + gpu_id if torch.cuda.is_available() else 'cpu')
+
   count.value += 1
 
   lock.release()
 
-  vae = model_util.load_vae(model_name_or_path, weight_dtype)
+  args = args_input
+  weight_dtype = weight_dtype_input
+
+
+  # 画像をひとつずつ適切なbucketに割り当てながらlatentを計算する
+  bucket_aspect_ratios = np.array(bucket_aspect_ratios_input).copy()
+  buckets_imgs = [[] for _ in range(len(bucket_resos_input))]
+  bucket_counts = [0 for _ in range(len(bucket_resos_input))]
+  img_ar_errors = []
+
+  vae = model_util.load_vae(args.model_name_or_path, weight_dtype)
   vae.eval()
   vae.to(DEVICE, dtype=weight_dtype)
 
-def process(args):
-  index, is_last, bucket, weight_dtype, batch_size, train_data_dir, full_path, flip_aug = args
-  if (is_last and len(bucket) > 0) or len(bucket) >= batch_size:
-    latents = get_latents(vae, [img for _, _, img in bucket], weight_dtype)
-
-    for (image_key, _, _), latent in zip(bucket, latents):
-      npz_file_name = get_npz_filename_wo_ext(train_data_dir, image_key, full_path, False)
-      np.savez(npz_file_name, latent)
-
-    # flip
-    if flip_aug:
-      latents = get_latents(vae, [img[:, ::-1].copy() for _, _, img in bucket], weight_dtype)   # copyがないとTensor変換できない
-
-      for (image_key, _, _), latent in zip(bucket, latents):
-        npz_file_name = get_npz_filename_wo_ext(train_data_dir, image_key, full_path, True)
-        np.savez(npz_file_name, latent)
-
-    return index, True
-  return index, False
-
-def main(args):
-  image_paths = train_util.glob_images(args.train_data_dir)
-  print(f"found {len(image_paths)} images.")
-
-  if os.path.exists(args.in_json):
-    print(f"loading existing metadata: {args.in_json}")
-    with open(args.in_json, "rt", encoding='utf-8') as f:
-      metadata = json.load(f)
-  else:
-    print(f"no metadata / メタデータファイルがありません: {args.in_json}")
-    return
-
-  weight_dtype = torch.float32
-  if args.mixed_precision == "fp16":
-    weight_dtype = torch.float16
-  elif args.mixed_precision == "bf16":
-    weight_dtype = torch.bfloat16
-
-  lock = multiprocessing.Lock()
-  count = multiprocessing.Value('i', 0)
-  pool = multiprocessing.Pool(
-    args.num_gpu_workers, initializer=init_worker, initargs=(
-    args.model_name_or_path, weight_dtype,lock,count, args.num_gpu_workers))
-
-
-  # bucketのサイズを計算する
-  max_reso = tuple([int(t) for t in args.max_resolution.split(',')])
-  assert len(max_reso) == 2, f"illegal resolution (not 'width,height') / 画像サイズに誤りがあります。'幅,高さ'で指定してください: {args.max_resolution}"
-
-  bucket_resos, bucket_aspect_ratios = model_util.make_bucket_resolutions(
-      max_reso, args.min_bucket_reso, args.max_bucket_reso)
-
-  # 画像をひとつずつ適切なbucketに割り当てながらlatentを計算する
-  bucket_aspect_ratios = np.array(bucket_aspect_ratios)
-  buckets_imgs = [[] for _ in range(len(bucket_resos))]
-  bucket_counts = [0 for _ in range(len(bucket_resos))]
-  img_ar_errors = []
-
-  def process_batch(is_last):
-    # for j in range(len(buckets_imgs)):
-    for index, processed in pool.imap_unordered(process, [
-      (j, is_last, buckets_imgs[j], weight_dtype, args.batch_size, args.train_data_dir, args.full_path, args.flip_aug)
-      for j in range(len(buckets_imgs))]):
-      if processed:
-        buckets_imgs[index].clear()
-
-  # 読み込みの高速化のためにDataLoaderを使うオプション
-  if args.max_data_loader_n_workers is not None:
-    dataset = train_util.ImageLoadingDataset(image_paths)
-    data = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False,
-                                       num_workers=args.max_data_loader_n_workers, collate_fn=collate_fn_remove_corrupted, drop_last=False)
-  else:
-    data = [[(None, ip)] for ip in image_paths]
-
-  for data_entry in tqdm(data, smoothing=0.0):
+def process_image(data_entry):
+    data_entry
     if data_entry[0] is None:
-      continue
+      return
 
     img_tensor, image_path = data_entry[0]
     if img_tensor is not None:
@@ -168,7 +122,7 @@ def main(args):
           image = image.convert("RGB")
       except Exception as e:
         print(f"Could not load image path / 画像を読み込めません: {image_path}, error: {e}")
-        continue
+        return
 
     image_key = image_path if args.full_path else os.path.splitext(os.path.basename(image_path))[0]
     if image_key not in metadata:
@@ -215,7 +169,7 @@ def main(args):
           found = False
           break
       if found:
-        continue
+        return
 
     # 画像をリサイズしてトリミングする
     # PILにinter_areaがないのでcv2で……
@@ -233,11 +187,6 @@ def main(args):
     # cv2.imwrite(f"r:\\test\\img_{i:05d}.jpg", image[:, :, ::-1])
 
     # バッチへ追加
-    
-    # img_bytes = io.BytesIO()
-    # image.save(img_bytes, format='JPEG')
-    # img_bytes = img_bytes.getvalue()
-
     buckets_imgs[bucket_id].append((image_key, reso, image))
     bucket_counts[bucket_id] += 1
     metadata[image_key]['train_resolution'] = reso
@@ -245,8 +194,76 @@ def main(args):
     # バッチを推論するか判定して推論する
     process_batch(False)
 
-  # 残りを処理する
+def process_batch(is_last):
+  for j in range(len(buckets_imgs)):
+    bucket = buckets_imgs[j]
+    if (is_last and len(bucket) > 0) or len(bucket) >= args.batch_size:
+      latents = get_latents(vae, [img for _, _, img in bucket], weight_dtype)
+
+      for (image_key, _, _), latent in zip(bucket, latents):
+        npz_file_name = get_npz_filename_wo_ext(args.train_data_dir, image_key, args.full_path, False)
+        np.savez(npz_file_name, latent)
+
+      # flip
+      if args.flip_aug:
+        latents = get_latents(vae, [img[:, ::-1].copy() for _, _, img in bucket], weight_dtype)   # copyがないとTensor変換できない
+
+        for (image_key, _, _), latent in zip(bucket, latents):
+          npz_file_name = get_npz_filename_wo_ext(args.train_data_dir, image_key, args.full_path, True)
+          np.savez(npz_file_name, latent)
+
+      bucket.clear()
+
+def finalize(_):
   process_batch(True)
+
+def main(args):
+  image_paths = train_util.glob_images(args.train_data_dir)
+  print(f"found {len(image_paths)} images.")
+
+  if os.path.exists(args.in_json):
+    print(f"loading existing metadata: {args.in_json}")
+    with open(args.in_json, "rt", encoding='utf-8') as f:
+      metadata_input = json.load(f)
+
+      manager = multiprocessing.Manager()
+      metadata = manager.dict()
+  
+      metadata.update(metadata_input)
+  else:
+    print(f"no metadata / メタデータファイルがありません: {args.in_json}")
+    return
+
+  weight_dtype = torch.float32
+  if args.mixed_precision == "fp16":
+    weight_dtype = torch.float16
+  elif args.mixed_precision == "bf16":
+    weight_dtype = torch.bfloat16
+
+  # bucketのサイズを計算する
+  max_reso = tuple([int(t) for t in args.max_resolution.split(',')])
+  assert len(max_reso) == 2, f"illegal resolution (not 'width,height') / 画像サイズに誤りがあります。'幅,高さ'で指定してください: {args.max_resolution}"
+
+  bucket_resos, bucket_aspect_ratios = model_util.make_bucket_resolutions(
+      max_reso, args.min_bucket_reso, args.max_bucket_reso)
+
+  # 読み込みの高速化のためにDataLoaderを使うオプション
+  if args.max_data_loader_n_workers is not None:
+    dataset = train_util.ImageLoadingDataset(image_paths)
+    data = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False,
+                                       num_workers=args.max_data_loader_n_workers, collate_fn=collate_fn_remove_corrupted, drop_last=False)
+  else:
+    data = [[(None, ip)] for ip in image_paths]
+
+  lock = multiprocessing.Lock()
+  process_count = multiprocessing.Value('i', 0)
+  pool = multiprocessing.Pool(args.num_gpus, initializer=initialize, initargs=(lock, process_count, bucket_aspect_ratios, args, weight_dtype, bucket_resos, metadata))
+
+  for data_entry in tqdm(pool.imap_unordered(process_image, data), total=len(data), smoothing=0.0):
+    pass
+
+  for data_entry in pool.imap_unordered(finalize, [None] * args.num_gpus):
+    pass
 
   for i, (reso, count) in enumerate(zip(bucket_resos, bucket_counts)):
     print(f"bucket {i} {reso}: {count}")
@@ -256,7 +273,7 @@ def main(args):
   # metadataを書き出して終わり
   print(f"writing metadata: {args.out_json}")
   with open(args.out_json, "wt", encoding='utf-8') as f:
-    json.dump(metadata, f, indent=2)
+    json.dump(dict(metadata), f, indent=2)
   print("done!")
 
 
@@ -283,6 +300,7 @@ if __name__ == '__main__':
                       help="flip augmentation, save latents for flipped images / 左右反転した画像もlatentを取得、保存する")
   parser.add_argument("--skip_existing", action="store_true",
                       help="skip images if npz already exists (both normal and flipped exists if flip_aug is enabled) / npzが既に存在する画像をスキップする（flip_aug有効時は通常、反転の両方が存在する画像をスキップ）")
-  parser.add_argument("--num_gpu_workers", type=int, default=1)
+  parser.add_argument("--num_gpus", type=int, default=1, help="number of GPUs to use / 使用するGPU数")
+
   args = parser.parse_args()
   main(args)
