@@ -64,9 +64,8 @@ args = None
 weight_dtype = None
 vae =  None
 bucket_resos = None
-metadata = None
 
-def initialize(lock, count, bucket_aspect_ratios_input, args_input, weight_dtype_input, bucket_resos_input, metadata_input):
+def initialize(lock, count, bucket_aspect_ratios_input, args_input, weight_dtype_input, bucket_resos_input):
   global bucket_aspect_ratios
   global buckets_imgs
   global bucket_counts
@@ -75,11 +74,8 @@ def initialize(lock, count, bucket_aspect_ratios_input, args_input, weight_dtype
   global weight_dtype
   global vae
   global bucket_resos
-  global metadata
 
   bucket_resos = bucket_resos_input
-
-  metadata = metadata_input
 
   global DEVICE
   lock.acquire()
@@ -103,12 +99,12 @@ def initialize(lock, count, bucket_aspect_ratios_input, args_input, weight_dtype
   bucket_counts = [0 for _ in range(len(bucket_resos_input))]
   img_ar_errors = []
 
-  vae = model_util.load_vae(args.model_name_or_path, weight_dtype)
-  vae.eval()
-  vae.to(DEVICE, dtype=weight_dtype)
+  # vae = model_util.load_vae(args.model_name_or_path, weight_dtype)
+  # vae.eval()
+  # vae.to(DEVICE, dtype=weight_dtype)
 
-def process_image(data_entry):
-    data_entry
+def process_image(args_input):
+    data_entry, metadata = args_input
     if data_entry[0] is None:
       return
 
@@ -125,8 +121,8 @@ def process_image(data_entry):
         return
 
     image_key = image_path if args.full_path else os.path.splitext(os.path.basename(image_path))[0]
-    if image_key not in metadata:
-      metadata[image_key] = {}
+    # if image_key not in metadata.keys():
+    #   metadata[image_key] = manager.dict()
 
     # 本当はこの部分もDataSetに持っていけば高速化できるがいろいろ大変
     aspect_ratio = image.width / image.height
@@ -135,6 +131,8 @@ def process_image(data_entry):
     reso = bucket_resos[bucket_id]
     ar_error = ar_errors[bucket_id]
     img_ar_errors.append(abs(ar_error))
+
+    metadata[image_key]['train_resolution'] = reso
 
     # どのサイズにリサイズするか→トリミングする方向で
     if ar_error <= 0:                   # 横が長い→縦を合わせる
@@ -189,7 +187,6 @@ def process_image(data_entry):
     # バッチへ追加
     buckets_imgs[bucket_id].append((image_key, reso, image))
     bucket_counts[bucket_id] += 1
-    metadata[image_key]['train_resolution'] = reso
 
     # バッチを推論するか判定して推論する
     process_batch(False)
@@ -217,19 +214,51 @@ def process_batch(is_last):
 def finalize(_):
   process_batch(True)
 
+import itertools
+
+
+import time
+
+def make_shared_dict(manager, d):
+    """
+    Recursively creates a shared dictionary using Manager.
+    """
+    if isinstance(d, dict):
+        return manager.dict({k: make_shared_dict(manager, v) for k, v in d.items()})
+    elif isinstance(d, list):
+        return [make_shared_dict(manager, i) for i in d]
+    else:
+        return d
+
 def main(args):
   image_paths = train_util.glob_images(args.train_data_dir)
   print(f"found {len(image_paths)} images.")
 
+  manager = multiprocessing.Manager()
   if os.path.exists(args.in_json):
     print(f"loading existing metadata: {args.in_json}")
     with open(args.in_json, "rt", encoding='utf-8') as f:
       metadata_input = json.load(f)
+      # metadata = manager.dict(metadata_input)
+      s = time.time()
 
-      manager = multiprocessing.Manager()
-      metadata = manager.dict()
+      
+      metadata_tmp = {}
+      for k, v in tqdm(metadata_input.items()):
+        metadata_tmp[k] = manager.dict(v)
+
+      metadata = manager.dict(metadata_tmp)
+
+      # manager = multiprocessing.Manager()
+      # make_shared_dict(manager, metadata_input)
+
+      # print(time.time() -s)
+
+      # manager = multiprocessing.Manager()
+      # metadata = manager.dict()
   
-      metadata.update(metadata_input)
+      
+      # metadata.update(metadata_input)
   else:
     print(f"no metadata / メタデータファイルがありません: {args.in_json}")
     return
@@ -257,23 +286,30 @@ def main(args):
 
   lock = multiprocessing.Lock()
   process_count = multiprocessing.Value('i', 0)
-  pool = multiprocessing.Pool(args.num_gpus, initializer=initialize, initargs=(lock, process_count, bucket_aspect_ratios, args, weight_dtype, bucket_resos, metadata))
+  pool = multiprocessing.Pool(args.num_gpus, initializer=initialize, initargs=(lock, process_count, bucket_aspect_ratios, args, weight_dtype, bucket_resos))
 
-  for data_entry in tqdm(pool.imap_unordered(process_image, data), total=len(data), smoothing=0.0):
+  for data_entry in tqdm(pool.imap_unordered(process_image, zip(data, itertools.repeat(metadata))), total=len(data), smoothing=0.0):
+    # import IPython; IPython.embed()
     pass
 
   for data_entry in pool.imap_unordered(finalize, [None] * args.num_gpus):
     pass
 
-  for i, (reso, count) in enumerate(zip(bucket_resos, bucket_counts)):
-    print(f"bucket {i} {reso}: {count}")
-  img_ar_errors = np.array(img_ar_errors)
-  print(f"mean ar error: {np.mean(img_ar_errors)}")
+  # for i, (reso, count) in enumerate(zip(bucket_resos, bucket_counts)):
+  #   print(f"bucket {i} {reso}: {count}")
+  # img_ar_errors = np.array(img_ar_errors)
+  # print(f"mean ar error: {np.mean(img_ar_errors)}")
 
   # metadataを書き出して終わり
   print(f"writing metadata: {args.out_json}")
   with open(args.out_json, "wt", encoding='utf-8') as f:
-    json.dump(dict(metadata), f, indent=2)
+    # convert manager.dict to ordinary dict
+    
+    metadata_tmp = {}
+    for k, v in tqdm(metadata.items()):
+      metadata_tmp[k] = dict(v)
+
+    json.dump(metadata_tmp, f, indent=2)
   print("done!")
 
 

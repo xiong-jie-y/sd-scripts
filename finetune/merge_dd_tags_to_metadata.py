@@ -11,6 +11,8 @@ from PIL import Image
 def main(args):
   assert not args.recursive or (args.recursive and args.full_path), "recursive requires full_path / recursiveはfull_pathと同時に指定してください"
 
+  os.makedirs(os.path.dirname(args.out_json), exist_ok=True)
+
   train_data_dir_path = Path(args.train_data_dir)
   image_paths: List[Path] = train_util.glob_images_pathlib(train_data_dir_path, args.recursive)
   print(f"found {len(image_paths)} images.")
