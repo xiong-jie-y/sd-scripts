@@ -12,7 +12,7 @@ python finetune/prepare_buckets_latents.py \
    --max_bucket_reso=1536 \
    --num_gpus 8 \
    --v2 \
-   --max_data_loader_n_workers=4 \
+   --max_data_loader_n_workers=4
 nohup accelerate launch --num_cpu_threads_per_process 8 fine_tune.py     \
    --pretrained_model_name_or_path=runwayml/stable-diffusion-v1-5  \
    --train_data_dir=$1  \
