@@ -4,7 +4,7 @@ python finetune/merge_dd_tags_to_metadata.py $1 $3/meta_cap_dd.json
 python finetune/clean_captions_and_tags.py $1 $3/meta_cap_dd.json $3/meta_clean.json
 python finetune/prepare_buckets_latents.py \
    $1 $3/meta_clean.json $3/meta_lat.json \
-   runwayml/stable-diffusion-v1-5 \
+   stabilityai/stable-diffusion-2-1 \
    --batch_size=14 \
    --max_resolution=896,896 \
    --mixed_precision=fp16 \
@@ -14,7 +14,7 @@ python finetune/prepare_buckets_latents.py \
    --v2 \
    --max_data_loader_n_workers=4
 nohup accelerate launch --num_cpu_threads_per_process 8 fine_tune.py     \
-   --pretrained_model_name_or_path=runwayml/stable-diffusion-v1-5  \
+   --pretrained_model_name_or_path=stabilityai/stable-diffusion-2-1  \
    --train_data_dir=$1  \
    --output_dir=$2   \
    --shuffle_caption\
@@ -28,6 +28,7 @@ nohup accelerate launch --num_cpu_threads_per_process 8 fine_tune.py     \
    --save_every_n_epochs=1 \
    --xformers \
    --train_text_encoder \
+   --save_state \
    --v2 \
    --lr_scheduler=cosine_with_restarts \
    --v_parameterization > nohup3.out 2>&1 &
